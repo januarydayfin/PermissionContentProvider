@@ -1,0 +1,217 @@
+/*
+ * Copyright (C) 2016 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package androidx.room;
+
+import android.annotation.SuppressLint;
+import android.app.ActivityManager;
+import android.content.Context;
+import android.database.Cursor;
+import android.os.Build;
+import android.os.CancellationSignal;
+import android.os.Looper;
+import android.util.Log;
+
+import androidx.annotation.CallSuper;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.annotation.RequiresApi;
+import androidx.annotation.RestrictTo;
+import androidx.annotation.WorkerThread;
+import androidx.arch.core.executor.ArchTaskExecutor;
+import androidx.room.migration.Migration;
+import androidx.room.util.SneakyThrow;
+import androidx.sqlite.db.SimpleSQLiteQuery;
+import androidx.sqlite.db.SupportSQLiteDatabase;
+import androidx.sqlite.db.SupportSQLiteOpenHelper;
+import androidx.sqlite.db.SupportSQLiteQuery;
+import androidx.sqlite.db.SupportSQLiteStatement;
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+/**
+ * Base class for all Room databases. All classes that are annotated with {@link Database} must
+ * extend this class.
+ * <p>
+ * RoomDatabase provides direct access to the underlying database implementation but you should
+ * prefer using {@link Dao} classes.
+ *
+ * @see Database
+ */
+public abstract class RoomDatabase {
+    private static final String DB_IMPL_SUFFIX = "_Impl";
+    /**
+     * Unfortunately, we cannot read this value so we are only setting it to the SQLite default.
+     *
+     * @hide
+     */
+    @RestrictTo(RestrictTo.Scope.LIBRARY_GROUP_PREFIX)
+    public static final int MAX_BIND_PARAMETER_CNT = 999;
+    /**
+     * Set by the generated open helper.
+     *
+     * @deprecated Will be hidden in the next release.
+     */
+    @Deprecated
+    protected volatile SupportSQLiteDatabase mDatabase;
+    private Executor mQueryExecutor;
+    private Executor mTransactionExecutor;
+    private SupportSQLiteOpenHelper mOpenHelper;
+    private final InvalidationTracker mInvalidationTracker;
+    private boolean mAllowMainThreadQueries;
+    boolean mWriteAheadLoggingEnabled;
+
+    /**
+     * @deprecated Will be hidden in the next release.
+     */
+    @Nullable
+    @Deprecated
+    protected List<Callback> mCallbacks;
+
+    private final ReentrantReadWriteLock mCloseLock = new ReentrantReadWriteLock();
+
+    /**
+     * {@link InvalidationTracker} uses this lock to prevent the database from closing while it is
+     * querying database updates.
+     * <p>
+     * The returned lock is reentrant and will allow multiple threads to acquire the lock
+     * simultaneously until {@link #close()} is invoked in which the lock becomes exclusive as
+     * a way to let the InvalidationTracker finish its work before closing the database.
+     *
+     * @return The lock for {@link #close()}.
+     */
+    Lock getCloseLock() {
+        return mCloseLock.readLock();
+    }
+
+    /**
+     * This id is only set on threads that are used to dispatch coroutines within a suspending
+     * database transaction.
+     */
+    private final ThreadLocal<Integer> mSuspendingTransactionId = new ThreadLocal<>();
+
+    /**
+     * Gets the suspending transaction id of the current thread.
+     *
+     * @hide
+     */
+    @RestrictTo(RestrictTo.Scope.LIBRARY_GROUP)
+    ThreadLocal<Integer> getSuspendingTransactionId() {
+        return mSuspendingTransactionId;
+    }
+
+
+    private final Map<String, Object> mBackingFieldMap = new ConcurrentHashMap<>();
+
+    /**
+     * Gets the map for storing extension properties of Kotlin type.
+     *
+     * @hide
+     */
+    @RestrictTo(RestrictTo.Scope.LIBRARY_GROUP)
+    Map<String, Object> getBackingFieldMap() {
+        return mBackingFieldMap;
+    }
+
+    /**
+     * Creates a RoomDatabase.
+     * <p>
+     * You cannot create an instance of a database, instead, you should acquire it via
+     * {@link Room#databaseBuilder(Context, Class, String)} or
+     * {@link Room#inMemoryDatabaseBuilder(Context, Class)}.
+     */
+    public RoomDatabase() {
+        mInvalidationTracker = createInvalidationTracker();
+    }
+
+    /**
+     * Called by {@link Room} when it is initialized.
+     *
+     * @param configuration The database configuration.
+     */
+    @CallSuper
+    public void init(@NonNull DatabaseConfiguration configuration) {
+        mOpenHelper = createOpenHelper(configuration);
+        if (mOpenHelper instanceof SQLiteCopyOpenHelper) {
+            SQLiteCopyOpenHelper copyOpenHelper = (SQLiteCopyOpenHelper) mOpenHelper;
+            copyOpenHelper.setDatabaseConfiguration(configuration);
+        }
+        boolean wal = false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+            wal = configuration.journalMode == JournalMode.WRITE_AHEAD_LOGGING;
+            mOpenHelper.setWriteAheadLoggingEnabled(wal);
+        }
+        mCallbacks = configuration.callbacks;
+        mQueryExecutor = configuration.queryExecutor;
+        mTransactionExecutor = new TransactionExecutor(configuration.transactionExecutor);
+        mAllowMainThreadQueries = configuration.allowMainThreadQueries;
+        mWriteAheadLoggingEnabled = wal;
+        if (configuration.multiInstanceInvalidation) {
+            mInvalidationTracker.startMultiInstanceInvalidation(configuration.context,
+                    configuration.name);
+        }
+    }
+
+    /**
+     * Returns the SQLite open helper used by this database.
+     *
+     * @return The SQLite open helper used by this database.
+     */
+    @NonNull
+    public SupportSQLiteOpenHelper getOpenHelper() {
+        return mOpenHelper;
+    }
+
+    /**
+     * Creates the open helper to access the database. Generated class already implements this
+     * method.
+     * Note that this method is called when the RoomDatabase is initialized.
+     *
+     * @param config The configuration of the Room database.
+     * @return A new SupportSQLiteOpenHelper to be used while connecting to the database.
+     */
+    @NonNull
+    protected abstract SupportSQLiteOpenHelper createOpenHelper(DatabaseConfiguration config);
+
+    /**
+     * Called when the RoomDatabase is created.
+     * <p>
+     * This is already implemented by the generated code.
+     *
+     * @return Creates a new InvalidationTracker.
+     */
+    @NonNull
+    protected abstract InvalidationTracker createInvalidationTracker();
+
+    /**
+     * Deletes all rows from all the tables that are registered to this database as
+     * {@link Database#entities()}.
+     * <p>
+     * This does NOT r
